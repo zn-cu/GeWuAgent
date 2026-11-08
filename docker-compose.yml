@@ -1,0 +1,135 @@
+# ============================================================================
+# 格物致知（Gewu）本地依赖服务 —— 一键启动
+#
+# 启动：双击 docker-start.bat   或在本目录执行  docker compose up -d
+# 停止：双击 docker-stop.bat    或  docker compose down     （不会删数据）
+# 说明：docker\README.md
+#
+# 这一套只包含「基础设施」容器（Milvus / etcd / MinIO / Attu / MongoDB）。
+# Python 端的两个 FastAPI 服务仍然在宿主机上用 uvicorn 起，端口见 README。
+#
+# 数据目录沿用你原来的位置，换到 compose 管理不会丢数据：
+#   etcd   -> D:\milvus\volumes\etcd
+#   minio  -> D:\milvus\volumes\minio
+#   milvus -> D:\milvus\volumes\milvus
+#   mongo  -> docker 具名卷 gewu-mongo-data（老数据迁移见 docker\migrate-mongo-data.ps1）
+#   attu   -> 复用已有具名卷 attu-data
+#
+# 想把这个目录整体挪进项目里，在本项目 .env 中加一行即可，例如：
+#   MILVUS_ETCD_DIR=./docker/volumes/etcd
+#   MILVUS_MINIO_DIR=./docker/volumes/minio
+#   MILVUS_DATA_DIR=./docker/volumes/milvus
+# ============================================================================
+
+name: gewu
+
+services:
+  # ---------------------------------------------------------------- Milvus 依赖
+  etcd:
+    container_name: milvus-etcd
+    image: quay.io/coreos/etcd:v3.5.25
+    restart: unless-stopped
+    environment:
+      ETCD_AUTO_COMPACTION_MODE: revision
+      ETCD_AUTO_COMPACTION_RETENTION: "1000"
+      ETCD_QUOTA_BACKEND_BYTES: "4294967296"
+      ETCD_SNAPSHOT_COUNT: "50000"
+    volumes:
+      - ${MILVUS_ETCD_DIR:-D:/milvus/volumes/etcd}:/etcd
+    command: etcd -advertise-client-urls=http://etcd:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  minio:
+    container_name: milvus-minio
+    image: milvusdb/minio:RELEASE.2024-12-18T13-15-44Z
+    restart: unless-stopped
+    environment:
+      # 直接复用 .env 里的 minio 账号，避免两处不一致
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
+    ports:
+      - "9002:9000"   # 数据端口（.env 里 MINIO_ENDPOINT=127.0.0.1:9002）
+      - "9003:9001"   # 控制台端口
+    volumes:
+      - ${MILVUS_MINIO_DIR:-D:/milvus/volumes/minio}:/minio_data
+    command: minio server /minio_data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  # ------------------------------------------------------------------- Milvus
+  standalone:
+    container_name: milvus-standalone
+    image: milvusdb/milvus:v2.6.24
+    restart: unless-stopped
+    command: ["milvus", "run", "standalone"]
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+    volumes:
+      - ${MILVUS_DATA_DIR:-D:/milvus/volumes/milvus}:/var/lib/milvus
+    ports:
+      - "19530:19530"  # .env 里 MILVUS_URL=http://127.0.0.1:19530
+      - "9091:9091"    # 健康检查 / metrics
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      start_period: 90s
+      timeout: 20s
+      retries: 3
+    depends_on:
+      etcd:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+  # --------------------------------------------------------- Milvus 可视化界面
+  attu:
+    container_name: attu
+    image: zilliz/attu:v3.0.0
+    restart: unless-stopped
+    environment:
+      # 同一个 compose 网络内直接用容器名访问，比 host.docker.internal 更稳
+      MILVUS_URL: milvus-standalone:19530
+      MILVUS_ADDRESS: milvus-standalone:19530
+    ports:
+      - "3000:3000"
+    volumes:
+      - attu-data:/data
+    depends_on:
+      standalone:
+        condition: service_started
+
+  # ------------------------------------------------------------------ MongoDB
+  mongo:
+    container_name: mongo
+    image: mongo
+    restart: unless-stopped
+    ports:
+      - "27017:27017"  # .env 里 MONGO_URL=mongodb://127.0.0.1:27017
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  # 具名卷：留在 Docker 里，比把 mongo 数据放到 Windows 绑定目录上稳（避免文件锁问题）
+  mongo-data:
+    name: ${MONGO_VOLUME_NAME:-gewu-mongo-data}
+  # 沿用你原来的 attu 卷（里面是 Attu 的登录/连接配置）
+  attu-data:
+    name: ${ATTU_VOLUME_NAME:-attu-data}

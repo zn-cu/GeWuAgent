@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>格物致知 · 文件导入</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #f5f7fa;
+            margin: 0;
+            padding: 20px;
+            display: flex;
+            justify-content: center;
+        }
+        .container {
+            width: 100%;
+            max-width: 800px;
+            background-color: white;
+            padding: 30px;
+            border-radius: 12px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #2c3e50;
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        .upload-area {
+            border: 2px dashed #3498db;
+            border-radius: 8px;
+            padding: 40px;
+            text-align: center;
+            cursor: pointer;
+            transition: background-color 0.3s;
+            margin-bottom: 20px;
+        }
+        .upload-area:hover {
+            background-color: #ecf6fd;
+        }
+        .upload-icon {
+            font-size: 48px;
+            color: #3498db;
+            margin-bottom: 10px;
+        }
+        .file-input {
+            display: none;
+        }
+        .btn {
+            background-color: #3498db;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 16px;
+            transition: background-color 0.3s;
+        }
+        .btn:hover {
+            background-color: #2980b9;
+        }
+        .btn:disabled {
+            background-color: #bdc3c7;
+            cursor: not-allowed;
+        }
+        .file-list {
+            margin-top: 30px;
+        }
+        .file-item {
+            background-color: #fff;
+            border: 1px solid #e0e0e0;
+            border-radius: 6px;
+            padding: 15px;
+            margin-bottom: 10px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .file-info {
+            display: flex;
+            flex-direction: column;
+            flex: 1;
+            margin-right: 20px;
+        }
+        .file-name {
+            font-weight: 600;
+            color: #333;
+        }
+        .file-size {
+            font-size: 12px;
+            color: #7f8c8d;
+            margin-top: 4px;
+        }
+        .status-badge {
+            padding: 5px 10px;
+            border-radius: 15px;
+            font-size: 12px;
+            font-weight: bold;
+            color: white;
+            min-width: 80px;
+            text-align: center;
+        }
+        .status-uploading { background-color: #f39c12; }
+        .status-processing { background-color: #3498db; }
+        .status-completed { background-color: #2ecc71; }
+        .status-error { background-color: #e74c3c; }
+        
+        /* 简单的进度条 */
+        .progress-bar-container {
+            width: 100%;
+            height: 4px;
+            background-color: #f0f0f0;
+            margin-top: 8px;
+            border-radius: 2px;
+            overflow: hidden;
+            display: none;
+        }
+        .progress-bar {
+            height: 100%;
+            background-color: #f39c12;
+            width: 0%;
+            transition: width 0.3s, background-color 0.3s;
+        }
+
+        /* 任务日志（可展开/收起） */
+        .log-details {
+            margin-top: 8px;
+            font-size: 12px;
+            color: #7f8c8d;
+        }
+        .log-details summary {
+            cursor: pointer;
+            user-select: none;
+            color: #6c7a89;
+        }
+        .log-list {
+            margin: 6px 0 0 16px;
+            padding: 0;
+        }
+        .log-list li {
+            margin: 2px 0;
+            line-height: 1.4;
+        }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h1>📄 格物致知 · 知识库导入</h1>
+    
+    <div class="upload-area" id="dropZone" onclick="document.getElementById('fileInput').click()">
+        <div class="upload-icon">☁️</div>
+        <p>点击或拖拽文件到此处 (PDF/MD)</p>
+        <input type="file" id="fileInput" class="file-input" multiple accept=".pdf,.md">
+    </div>
+
+    <div id="fileList" class="file-list">
+        <!-- 文件列表将在这里生成 -->
+    </div>
+</div>
+
+<script>
+    const dropZone = document.getElementById('dropZone');
+    const fileInput = document.getElementById('fileInput');
+    const fileList = document.getElementById('fileList');
+    
+    // 模拟后端API地址
+    const API_BASE = 'http://127.0.0.1:8000';
+
+    // ------------------------- 进度计算 -------------------------
+    // 导入图（app/import_process/agent/main_graph.py）的节点顺序：
+    //   PDF 文件：entry → pdf_to_md → md_img → split → item_name → embedding → milvus（7 个节点）
+    //   MD  文件：entry → md_img → split → item_name → embedding → milvus（跳过 pdf_to_md，6 个）
+    // 再加上 /upload 接口里的「上传文件」这一步，就是总步数。
+    const NODES_PDF = [
+        'node_entry', 'node_pdf_to_md', 'node_md_img', 'node_document_split',
+        'node_item_name_recognition', 'node_bge_embedding', 'node_import_milvus',
+    ];
+    const NODES_MD = [
+        'node_entry', 'node_md_img', 'node_document_split',
+        'node_item_name_recognition', 'node_bge_embedding', 'node_import_milvus',
+    ];
+
+    function expectedTotalSteps(fileName) {
+        const name = String(fileName || '').toLowerCase();
+        const nodes = name.endsWith('.md') ? NODES_MD : NODES_PDF;
+        return nodes.length + 1; // +1 = 上传文件
+    }
+
+    // 后端 node_entry 只认 .pdf / .md；其它后缀既不置 is_pdf_read_enabled 也不置
+    // is_md_read_enabled，条件边会直接走 END，但任务状态仍然是 completed，
+    // 前端就会误报「已完成」。这里提前挡掉。
+    function isSupportedFile(fileName) {
+        const name = String(fileName || '').toLowerCase();
+        return name.endsWith('.pdf') || name.endsWith('.md');
+    }
+
+    // 按「已完成步数 / 总步数」算百分比；没结束前最多 99%，避免提前显示 100%
+    function computePercent(doneCount, totalSteps) {
+        if (!totalSteps || totalSteps <= 0) return 5;
+        const ratio = Math.min(doneCount, totalSteps) / totalSteps;
+        return Math.max(1, Math.min(99, Math.round(ratio * 100)));
+    }
+
+    function escapeHtml(str) {
+        return String(str)
+            .replaceAll('&', '&amp;')
+            .replaceAll('<', '&lt;')
+            .replaceAll('>', '&gt;')
+            .replaceAll('"', '&quot;')
+            .replaceAll("'", '&#039;');
+    }
+
+    dropZone.addEventListener('dragover', (e) => {
+        e.preventDefault();
+        dropZone.style.backgroundColor = '#ecf6fd';
+    });
+
+    dropZone.addEventListener('dragleave', (e) => {
+        e.preventDefault();
+        dropZone.style.backgroundColor = '';
+    });
+
+    dropZone.addEventListener('drop', (e) => {
+        e.preventDefault();
+        dropZone.style.backgroundColor = '';
+        handleFiles(e.dataTransfer.files);
+    });
+
+    fileInput.addEventListener('change', (e) => {
+        // 先取出 File 列表再把 input 清空，否则选同一个文件第二次不会触发 change
+        const picked = Array.from(e.target.files || []);
+        e.target.value = '';
+        picked.forEach(uploadFile);
+    });
+
+    function handleFiles(files) {
+        Array.from(files).forEach(uploadFile);
+    }
+
+    function updateProgressBar(bar, percentage, color) {
+        if (!bar) return;
+        const p = Math.max(0, Math.min(100, Number(percentage) || 0));
+        bar.style.width = p + '%';
+        // 处理中蓝色、完成绿色、失败红色；只给百分比的旧调用默认蓝色
+        bar.style.backgroundColor = color || (p >= 100 ? '#2ecc71' : '#3498db');
+    }
+
+    // 往该文件的日志列表里加一行（用于轮询异常/超时这类一次性提示）
+    function appendLogLine(itemEl, text) {
+        const logListEl = itemEl.querySelector('.log-list');
+        if (!logListEl) return;
+        const li = document.createElement('li');
+        li.textContent = text;
+        logListEl.appendChild(li);
+    }
+
+    async function uploadFile(file) {
+        // 创建文件项UI
+        const id = 'file-' + Math.random().toString(36).substr(2, 9);
+        const html = `
+            <div class="file-item" id="${id}">
+                <div class="file-info">
+                    <span class="file-name" title="${escapeHtml(file.name)}">${escapeHtml(file.name)}</span>
+                    <span class="file-size">${(file.size / 1024).toFixed(2)} KB</span>
+                    <div class="progress-bar-container">
+                        <div class="progress-bar"></div>
+                    </div>
+                    <details class="log-details">
+                        <summary>日志（点击展开）</summary>
+                        <ul class="log-list"></ul>
+                    </details>
+                </div>
+                <div class="status-badge status-uploading">上传中...</div>
+            </div>
+        `;
+        fileList.insertAdjacentHTML('afterbegin', html);
+        const itemEl = document.getElementById(id);
+        const statusBadge = itemEl.querySelector('.status-badge');
+        const progressBar = itemEl.querySelector('.progress-bar');
+        const progressContainer = itemEl.querySelector('.progress-bar-container');
+        const logDetails = itemEl.querySelector('.log-details');
+        const logSummary = itemEl.querySelector('.log-details summary');
+        const logListEl = itemEl.querySelector('.log-list');
+
+        // 构建FormData
+        const formData = new FormData();
+        formData.append('files', file);
+
+        // 拖拽进来的非 pdf/md 文件直接挡掉（后端会走 END 但报 completed）
+        if (!isSupportedFile(file.name)) {
+            statusBadge.textContent = '不支持';
+            statusBadge.className = 'status-badge status-error';
+            appendLogLine(itemEl, '仅支持 .pdf 和 .md 文件，已跳过');
+            return;
+        }
+
+        // 总步数按文件类型确定（PDF 8 步 / MD 7 步，含「上传文件」）
+        const totalSteps = expectedTotalSteps(file.name);
+
+        try {
+            // 1. 上传文件（fetch 拿不到上传字节进度，这里给起始值，真正进度从轮询开始）
+            progressContainer.style.display = 'block';
+            updateProgressBar(progressBar, computePercent(0, totalSteps));
+
+            const response = await fetch(`${API_BASE}/upload`, {
+                method: 'POST',
+                body: formData
+            });
+
+            if (!response.ok) throw new Error('Upload failed');
+            
+            const result = await response.json();
+            const taskId = result.task_ids[0]; // 一次上传一个文件，取第一个
+            if (!taskId) throw new Error('后端没有返回 task_id');
+
+            // 上传完成：「上传文件」这一步算完成，之后交给轮询推进
+            updateProgressBar(progressBar, computePercent(1, totalSteps));
+            statusBadge.textContent = '处理中...';
+            statusBadge.className = 'status-badge status-processing';
+
+            // 2. 轮询状态
+            pollStatus(taskId, itemEl, totalSteps);
+
+        } catch (error) {
+            console.error(error);
+            statusBadge.textContent = '失败';
+            statusBadge.className = 'status-badge status-error';
+            updateProgressBar(progressBar, 0, '#e74c3c');
+        }
+    }
+
+    function normalizeDoneLog(text) {
+        // 后端可能返回中文节点名，也可能已拼接“已完成”
+        if (typeof text !== 'string') return String(text);
+        return text.endsWith('已完成') ? text : `${text}已完成`;
+    }
+
+    function normalizeRunningLog(text) {
+        // 后端可能返回中文节点名，也可能已拼接“正在进行.../处理中...”
+        if (typeof text !== 'string') return String(text);
+        if (text.startsWith('正在进行')) return text.endsWith('...') ? text : `${text}...`;
+        return `正在进行${text}...`;
+    }
+
+    function renderLogs(itemEl, doneList, runningList) {
+        const logSummary = itemEl.querySelector('.log-details summary');
+        const logListEl = itemEl.querySelector('.log-list');
+        const logDetails = itemEl.querySelector('.log-details');
+
+        const done = Array.isArray(doneList) ? doneList : [];
+        const running = Array.isArray(runningList) ? runningList : [];
+
+        // 更新 summary（即使收起也能看到进度）
+        logSummary.textContent = `日志（已完成${done.length}，进行中${running.length}，点击展开）`;
+
+        // 清空并重建列表
+        logListEl.innerHTML = '';
+        const lines = [
+            ...done.map(normalizeDoneLog),
+            ...running.map(normalizeRunningLog),
+        ];
+
+        if (lines.length === 0) {
+            const li = document.createElement('li');
+            li.textContent = '暂无日志';
+            logListEl.appendChild(li);
+        } else {
+            for (const line of lines) {
+                const li = document.createElement('li');
+                li.textContent = line;
+                logListEl.appendChild(li);
+            }
+        }
+
+        // 如果没有任何日志，默认收起；否则保持用户选择
+        if (lines.length === 0) {
+            logDetails.open = false;
+        }
+    }
+
+    function pollStatus(taskId, itemEl, totalSteps) {
+        const statusBadge = itemEl.querySelector('.status-badge');
+        const progressBar = itemEl.querySelector('.progress-bar');
+
+        // 兜底：连续失败太多次、或跟踪超时，就停下来，不要每 2 秒一直打接口
+        const MAX_CONSECUTIVE_ERRORS = 8;            // 约 16 秒
+        const MAX_DURATION_MS = 30 * 60 * 1000;      // 最长跟踪 30 分钟
+        let consecutiveErrors = 0;
+        const startedAt = Date.now();
+
+        const setBadge = (text, cls) => {
+            statusBadge.textContent = text;
+            statusBadge.className = 'status-badge ' + cls;
+        };
+
+        const interval = setInterval(async () => {
+            // 不管成没成功，先看有没有超时
+            if (Date.now() - startedAt > MAX_DURATION_MS) {
+                clearInterval(interval);
+                setBadge('跟踪超时', 'status-error');
+                appendLogLine(itemEl, '跟踪超过 30 分钟仍未结束，已停止轮询（后台任务可能卡住，请查看服务端日志）');
+                return;
+            }
+
+            try {
+                const res = await fetch(`${API_BASE}/status/${taskId}`);
+                if (!res.ok) throw new Error(`status HTTP ${res.status}`);
+                const data = await res.json();
+                consecutiveErrors = 0;
+
+                const done = Array.isArray(data.done_list) ? data.done_list : [];
+                const running = Array.isArray(data.running_list) ? data.running_list : [];
+                renderLogs(itemEl, done, running);
+
+                if (data.status === 'completed') {
+                    clearInterval(interval);
+                    setBadge('已完成', 'status-completed');
+                    updateProgressBar(progressBar, 100, '#2ecc71');
+                } else if (data.status === 'failed') {
+                    clearInterval(interval);
+                    setBadge('失败', 'status-error');
+                    updateProgressBar(progressBar, computePercent(done.length, totalSteps), '#e74c3c');
+                    appendLogLine(itemEl, `处理失败：已完成 ${done.length}/${totalSteps} 步，具体报错请看服务端日志`);
+                } else {
+                    // processing，或刚上传还没开始（后端 status 为空字符串）都落这里
+                    setBadge('处理中...', 'status-processing');
+                    updateProgressBar(progressBar, computePercent(done.length, totalSteps));
+                }
+            } catch (e) {
+                consecutiveErrors += 1;
+                console.error('Polling error', e);
+                if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+                    clearInterval(interval);
+                    setBadge('状态查询失败', 'status-error');
+                    appendLogLine(itemEl, `连续 ${MAX_CONSECUTIVE_ERRORS} 次查询进度失败，已停止轮询（检查 8000 服务是否还在运行）`);
+                }
+            }
+        }, 2000); // 每2秒轮询一次
+    }
+</script>
+
+</body>
+</html>

@@ -1,0 +1,10 @@
+# 默认按文本处理，仓库内统一 LF（Python/前端代码跨平台友好）
+* text=auto
+
+# 批处理 / PowerShell 脚本必须保留原始字节：
+#   - .bat 必须是 CRLF，且不能有 BOM
+#   - .ps1 需要 UTF-8 BOM（Windows PowerShell 5.1 才会正确读中文）
+# 标记为 -text 让 git 不做任何换行/编码转换，直接按原样存储，
+# 这样从 GitHub 下载 ZIP 得到的也是可用文件。
+*.bat -text
+*.ps1 -text
